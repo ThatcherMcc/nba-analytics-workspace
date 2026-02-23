@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "nba-engine": {
+      "command": "bash",
+      "type": "stdio",
+      "args": [
+        "-c",
+        "cd /home/thatchermcc/projects/nba-analytics-workspace/nba-data-backend && source .venv/bin/activate && python3 ai-tools/mcp/skills_mcp.py"
+      ]
+    },
+    "nba-website": {
+      "command": "bash",
+      "type": "stdio",
+      "args": [
+        "-c",
+        "cd /home/thatchermcc/projects/nba-analytics-workspace/nba-data-backend && source .venv/bin/activate && python3 ai-tools/mcp/frontend_mcp.py"
+      ]
+    }
+  }
+}
