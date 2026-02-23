@@ -71,3 +71,13 @@ temp/
 *.log
 *.local
 .cache/
+
+# Data
+nba-data-backend/*
+nba-prop-website/*
+
+.tmp/
+.claude/
+execution/**/*.pyc
+execution/**/__pycache__/
+*.log

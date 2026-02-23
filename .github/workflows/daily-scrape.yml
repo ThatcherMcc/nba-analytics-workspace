@@ -1,0 +1,91 @@
+# Daily pipeline at 3am ET: gamelogs → games → player_game_stats → props → revalidate.
+# Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET. Optional: SCRAPE_PROXIES, ODDS_API_KEY.
+name: Daily scrape
+
+on:
+  schedule:
+    # 3am US Eastern (8am UTC). Change to "0 3 * * *" for 3am UTC.
+    - cron: "0 8 * * *"
+  workflow_dispatch: # Allow manual run from Actions tab
+
+env:
+  BACKEND_DIR: nba-data-backend
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend deps (uv)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          uv sync --project ${{ env.BACKEND_DIR }}
+        env:
+          PATH: ${{ github.home }}/.local/bin:${{ github.home }}/.cargo/bin:$PATH
+
+      # ---- Phase 1: Gamelog pipeline ----
+      - name: Rescrape gamelogs
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.gamelogs
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
+        continue-on-error: true
+        # If scrape fails (rate limit, etc.), we still try to update from existing JSON
+
+      - name: Update games table
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+
+      - name: Update player_game_stats table
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+
+      # ---- Phase 2: Props pipeline (requires ODDS_API_KEY secret) ----
+      - name: Fetch prop lines from SportsGameOdds API
+        if: ${{ secrets.ODDS_API_KEY != '' }}
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --upcoming --max-objects 100 --min-remaining 200
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        continue-on-error: true
+
+      - name: Update games table from API events (upcoming games)
+        if: ${{ secrets.ODDS_API_KEY != '' }}
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games_from_api
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
+      - name: Insert player props into DB
+        if: ${{ secrets.ODDS_API_KEY != '' }}
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_props --json-dir=data/raw_json/2025-26
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
+      # ---- Phase 3: Revalidate ----
+      - name: Revalidate frontend cache
+        run: |
+          curl -sf -X POST "${{ secrets.APP_URL }}/api/revalidate" \
+            -H "Authorization: Bearer ${{ secrets.REVALIDATE_SECRET }}"
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}

@@ -1,0 +1,106 @@
+---
+description: Frontend-only context for the NBA prop website (Next.js). Use when working in nba-prop-website/ to avoid backend overlap.
+globs: nba-prop-website/**
+alwaysApply: false
+---
+
+# NBA Prop Website — Frontend Context
+
+When this rule applies, **treat the frontend as the primary scope**. Do not assume backend directives, MCP tools, or execution scripts are required unless the task explicitly involves API contracts, database writes, or calling the data pipeline.
+
+## Stack
+
+- **Next.js 14** (App Router), React, TypeScript
+- **Path alias**: `@/` → `src/*` (e.g. `@/app/components/PlayerSearch`, `@/db/schema`)
+- **Styling**: Tailwind CSS v4 (theme in `globals.css`: `:root` + `@theme inline`, dark mode via `prefers-color-scheme`)
+- **Database**: Drizzle ORM + Neon (`src/db/schema.ts`, `src/db/index.ts`). Connection uses `POSTGRES_URL` and `@neondatabase/serverless`.
+- **Charts**: Recharts (bar charts, tooltips, reference lines)
+- **Package manager**: pnpm
+
+## Where things live
+
+| What | Path |
+|------|------|
+| Pages & layout | `src/app/page.tsx`, `layout.tsx`, `globals.css` |
+| UI components | `src/app/components/` — PlayerSearch (container), PlayerCard, PlayerChartDisplay |
+| API routes | `src/app/api/update-players/route.ts`, `src/app/api/update-props/route.ts` |
+| DB schema & client | `src/db/schema.ts` (tables + `PLAYER_STAT_NAMES`, types), `src/db/index.ts` (drizzle + neon) |
+| Data helpers | `src/lib/data.ts` (getPlayerData, getPlayerNames, getPlayerExists, getPlayersOverSeasonAvgLast5, etc.). Player list: DB via `getPlayerNames()` (see `directives/features/frontend_data_readiness.md`). |
+| Config | `drizzle.config.ts`, `next.config.ts`, `tsconfig.json` |
+
+## Played-only / DNP exclusion
+
+All averages and “last N games” logic in `src/lib/data.ts` **exclude games where the player did not play**. Filter: only include rows where `minutes_played` (after trim, lowercased) is **not** one of:
+
+- `''` (empty), `'inactive'`, `'inact'`, `'did n'`, `'0'`, `'0:00'`
+
+DB stores DNP as e.g. **"Inact"** (inactive) or **"Did N"** (did not play). The constant `PLAYED_ONLY` and the same `NOT IN (...)` condition are used in: `getPlayerData`, `getTopScorersLastGame`, `getTopScorersLast7Days`, and `getPlayersOverSeasonAvgLast5` (both ranked and season_avg CTEs). When adding new queries that average or count games, use this same filter so season averages match “games actually played.”
+
+## Data flow
+
+- **Player list**: Canonical list from Neon `players` table via **`getPlayerNames()`** in `src/lib/data.ts`. Home page fetches it (cached), passes `playerNames` to `PlayerSearch` for search/datalist. Player page uses **`getPlayerExists(playerName)`** for 404. See `directives/features/frontend_data_readiness.md`.
+- **Game data**: User picks a player and optional “last N games” (5/10/15/20) → `getPlayerData(playerName, limit)` in `lib/data.ts` queries `player_game_stats` + `games` + `players` via Drizzle (played games only, desc by date). Data is shown in `PlayerChartDisplay` and used for hit-rate in `PlayerCard`.
+- **Homepage**: `getPlayersOverSeasonAvgLast5(limit)` returns players whose last-5-game average (points) is above their season average (played games only). Rendered by `OverSeasonAvgLast5`; click sets search + game count 5.
+- **Inbound writes**: Backend/execution push data via PUT to `/api/update-players` and `/api/update-props` (Bearer `UPDATE_API_KEY`).
+
+## Component roles
+
+- **PlayerSearch** (`"use client"`): Top-level container. State: playerName, selectedStat, propLineInput, gameCount (5/10/15/20), playerData, loading, playerFound. Fetches via `getPlayerData(playerName, gameCount)`, computes hit rate and verdict (useMemo), renders nav, search, “last N games” buttons, stat/line, PlayerCard, PlayerChartDisplay. When no search: HomeHero, OverSeasonAvgLast5, FeaturedPlayer.
+- **PlayerCard**: Presentational. Props: playerName, stat, propLine, hitRate, optional gameCount, verdict. Shows betting signal, your line, hit rate (Over), status (ON FIRE / STRETCH), consistency.
+- **PlayerChartDisplay** (`"use client"`): Recharts bar chart. Props: data (PlayerGameLog[]), statKey, propLine. Bars colored OVER/UNDER/PUSH vs line.
+- **OverSeasonAvgLast5**: Horizontal list of players over season avg (last 5); click selects player and sets game count to 5.
+- **FeaturedPlayer**, **HomeHero**: Homepage hero and featured player (e.g. LeBron) with card + chart.
+
+## DB schema (source of truth: `src/db/schema.ts`)
+
+- Relational: **players**, **games**, **teams**, **player_game_stats** (minutes_played, points, etc.), **prop_markets**, **player_props**.
+- **player_game_stats.minutes_played**: string — e.g. `"32"`, `"28:30"` when played; `"Inact"`, `"Did N"`, `"0"`, `"0:00"` for DNP (excluded from averages).
+- Exported types: `PlayerGameLog`, `PLAYER_STAT_NAMES`, `PLAYER_STAT_TYPE` for stats dropdown and chart.
+
+## API route details
+
+- **Auth**: Both PUT routes require `Authorization: Bearer <UPDATE_API_KEY>` (env: `UPDATE_API_KEY`).
+- **update-players**: Expects `PlayerGameLogs[]` (name + gamelogs with DATE, LOCATION, OPPONENT, MP, FG, FGA, etc.). Uses `@vercel/postgres` `sql` template — not Drizzle. Conflict: ON CONFLICT (player_name, game_date, opponent) DO UPDATE.
+- **update-props**: Expects array of snake_case props; maps to schema and batch-upserts with Drizzle (batch 100). Conflict on (playerName, gameDate, statType).
+
+## When to stay in the frontend
+
+- UI, components, client state, routing, styling
+- Reading from the DB via Drizzle in server actions or API routes
+- Adding pages/components or API routes that consume existing backend APIs
+- Using `getPlayerNames()` / `getPlayerExists()` for player list and validation (no static list; DB is source of truth)
+
+## When to involve the rest of the workspace
+
+- **API contract or DB schema changes**: Align with `directives/infrastructure/neon_schema.md` and backend `nba-data-backend/src/api/update_db/`
+- **New data pipeline or scraping**: Use workspace directives and execution/MCP (see AGENT.md) — backend scope
+- **New API route that triggers backend scripts**: Implementation lives here; orchestration/scripts live in `execution/` and `nba-data-backend/`
+
+## Frontend MCP (optional)
+
+When available, the **nba-website** MCP server exposes:
+
+- **list_frontend_structure**: Returns a tree of `src/` (app, components, api, db, lib). Use to orient before making changes.
+- **get_frontend_schema_summary**: Returns tables and columns from `src/db/schema.ts`. Use when adding features that touch the DB.
+
+Server runs from the backend repo: `nba-data-backend/ai-tools/mcp/frontend_mcp.py`. Configure in `.cursor/mcp.json` as `nba-website`.
+
+## Cache & revalidate
+
+- **Homepage and player pages** use `unstable_cache` (tag `player-data`, 24h revalidate). Cached so DB isn’t hit on every request.
+- **Player list** is loaded from the DB via `getPlayerNames()`; it falls back to `FALLBACK_PLAYER_NAMES` in `src/lib/playerNames.ts` if the DB fails or returns no rows. Revalidating tag `player-data` (e.g. after the pipeline runs) updates the list and all homepage data.
+- **After a scrape** (e.g. GitHub Actions), call **POST /api/revalidate** with `Authorization: Bearer <REVALIDATE_SECRET>` or `x-revalidate-secret: <REVALIDATE_SECRET>` to invalidate the cache so the next request gets fresh data. Set `REVALIDATE_SECRET` in env.
+
+## Commands (run from `nba-prop-website/`)
+
+```bash
+pnpm dev              # Dev server (Turbopack)
+pnpm build            # Production build
+pnpm lint             # ESLint
+pnpm drizzle-kit push # Push schema to Neon
+pnpm drizzle-kit studio # DB studio
+```
+
+## Principle
+
+Keep frontend work focused on this directory. Only pull in backend context when the task clearly needs it (e.g. “add an endpoint that calls the gamelog scraper” or “sync schema with Neon”).

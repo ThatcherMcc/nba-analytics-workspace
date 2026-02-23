@@ -1,0 +1,59 @@
+---
+description: Backend-only context for the NBA data pipeline (Python, Neon, MCP). Use when working in nba-data-backend/, directives/, or execution/ to avoid frontend overlap.
+globs: nba-data-backend/**,directives/**,execution/**
+alwaysApply: false
+---
+
+# NBA Data Backend — Pipeline Context
+
+When this rule applies, **treat the backend and data pipeline as the primary scope**. Do not assume Next.js or nba-prop-website changes are required unless the task explicitly involves API contracts, DB schema consumed by the frontend, or an API route that calls backend scripts.
+
+## Stack
+
+- **Python 3** (scripts, scrapers, update_db)
+- **Neon Postgres** (source of truth: `directives/infrastructure/neon_schema.md`)
+- **Data**: `nba-data-backend/data/` (player_names.csv, player_urls.json, player_gamelog_2026.json, teams_db_data.json, prop_line_df.csv)
+- **MCP**: Backend tools exposed as `mcp_nba-engine_*` (see AGENT.md)
+
+## Where things live
+
+| What | Path |
+|------|------|
+| Data collection & scrapers | `nba-data-backend/src/data_collection/` |
+| DB update scripts | `nba-data-backend/src/api/update_db/` |
+| Directives (what to do) | `directives/` (data/, features/, infrastructure/) |
+| Execution wrappers | `execution/` (e.g. execution/nba_data/) |
+| Neon schema (current) | `directives/infrastructure/neon_schema.md` |
+| Runbook (order to populate) | `directives/data/populate_relational_schema.md` |
+
+## When to stay in the backend
+
+- Scraping, processing, loading data into Neon
+- New or changed update_db scripts; runbook order
+- Directives, execution scripts, MCP tool changes
+- Schema export, scripts in `nba-data-backend/scripts/`
+
+## When to involve the frontend
+
+- **API contract or DB schema** the frontend uses: Align with `nba-prop-website/src/db/schema.ts` and any API routes that read/write the same tables.
+- **New API route that triggers a backend script**: Backend does the work; frontend may need a route that calls it (see AGENT.md).
+
+## Commands (run from `nba-data-backend/`)
+
+```bash
+source .venv/bin/activate
+python3 -m src.api.update_db.update_db_<name>   # e.g. update_db_games
+python3 scripts/export_neon_schema.py           # refresh directives/infrastructure/neon_schema.md
+```
+
+From workspace root, execution wrappers: `python execution/nba_data/<script>.py`.
+
+## What the frontend relies on
+
+- **players** table: canonical player list; frontend reads via Drizzle (`getPlayerNames()`, `getPlayerExists()`). No backend API for names.
+- **prop_markets**: seeded once with `update_prop_markets_to_db`; frontend uses when building prop features.
+- **player_game_stats.minutes_played**: DNP rows are inserted (raw MP e.g. `"Inact"`, `"0:00"`) so the frontend can exclude them from averages and show "Last game: DNP". See `directives/features/frontend_data_readiness.md`.
+
+## Principle
+
+Keep backend work focused on directives, execution, and nba-data-backend. Use **AGENT.md** for full workflow (directives → MCP/execution, script index, Neon, self-anneal). Only pull in frontend context when the task clearly needs it (e.g. “change the API the website calls” or “sync Drizzle schema with Neon”).
