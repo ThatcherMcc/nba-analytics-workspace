@@ -14,6 +14,8 @@ env:
 jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,6 +36,8 @@ jobs:
 
       # ---- Phase 1: Gamelog pipeline ----
       - name: Rescrape gamelogs
+        id: gamelogs
+        timeout-minutes: 30
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.gamelogs
         env:
@@ -43,12 +47,16 @@ jobs:
         # If scrape fails (rate limit, etc.), we still try to update from existing JSON
 
       - name: Update games table
+        id: games
+        timeout-minutes: 5
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
 
       - name: Update player_game_stats table
+        id: stats
+        timeout-minutes: 5
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
         env:
@@ -56,6 +64,8 @@ jobs:
 
       # ---- Phase 2: Props pipeline (requires ODDS_API_KEY secret) ----
       - name: Fetch prop lines from SportsGameOdds API
+        id: props-fetch
+        timeout-minutes: 10
         if: ${{ secrets.ODDS_API_KEY != '' }}
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --upcoming --max-objects 100 --min-remaining 200
@@ -64,6 +74,8 @@ jobs:
         continue-on-error: true
 
       - name: Update games table from API events (upcoming games)
+        id: games-api
+        timeout-minutes: 5
         if: ${{ secrets.ODDS_API_KEY != '' }}
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games_from_api
@@ -72,6 +84,8 @@ jobs:
         continue-on-error: true
 
       - name: Insert player props into DB
+        id: props-insert
+        timeout-minutes: 5
         if: ${{ secrets.ODDS_API_KEY != '' }}
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_props --json-dir=data/raw_json/2025-26
@@ -83,9 +97,56 @@ jobs:
 
       # ---- Phase 3: Revalidate ----
       - name: Revalidate frontend cache
+        id: revalidate
+        timeout-minutes: 2
         run: |
           curl -sf -X POST "${{ secrets.APP_URL }}/api/revalidate" \
             -H "Authorization: Bearer ${{ secrets.REVALIDATE_SECRET }}"
         env:
           APP_URL: ${{ secrets.APP_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
+      # ---- Phase 4: Health check ----
+      - name: Health check
+        id: health
+        if: always()
+        timeout-minutes: 1
+        run: |
+          response=$(curl -sf "${{ secrets.APP_URL }}/api/health" || echo "FAILED")
+          echo "Health check response: $response"
+          if echo "$response" | grep -q '"status":"ok"'; then
+            echo "Frontend is healthy"
+          else
+            echo "::warning::Frontend health check failed"
+          fi
+        continue-on-error: true
+
+      # ---- Phase 5: Reporting ----
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "## Daily Pipeline Summary - $(date -u '+%Y-%m-%d')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rescrape gamelogs | ${{ steps.gamelogs.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update games | ${{ steps.games.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update player_game_stats | ${{ steps.stats.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fetch props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update games from API | ${{ steps.games-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Insert player props | ${{ steps.props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revalidate cache | ${{ steps.revalidate.outcome }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Daily pipeline failed: ${new Date().toISOString().split('T')[0]}`,
+              body: `The daily scrape pipeline failed.\n\n[View run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\nSteps:\n- Gamelogs: \`${{ steps.gamelogs.outcome }}\`\n- Games: \`${{ steps.games.outcome }}\`\n- Stats: \`${{ steps.stats.outcome }}\`\n- Props fetch: \`${{ steps.props-fetch.outcome || 'skipped' }}\`\n- Games API: \`${{ steps.games-api.outcome || 'skipped' }}\`\n- Props insert: \`${{ steps.props-insert.outcome || 'skipped' }}\`\n- Revalidate: \`${{ steps.revalidate.outcome }}\``,
+              labels: ['pipeline-failure']
+            });
