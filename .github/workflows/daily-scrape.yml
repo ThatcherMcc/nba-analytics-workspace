@@ -69,6 +69,7 @@ jobs:
       - name: Update games table
         id: games
         timeout-minutes: 5
+        if: inputs.skip_scrape != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
         env:
@@ -77,6 +78,7 @@ jobs:
       - name: Update player_game_stats table
         id: stats
         timeout-minutes: 5
+        if: inputs.skip_scrape != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
         env:
