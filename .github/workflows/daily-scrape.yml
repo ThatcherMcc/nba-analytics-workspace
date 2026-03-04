@@ -21,6 +21,7 @@ on:
 
 env:
   BACKEND_DIR: nba-data-backend
+  HAS_ODDS_KEY: ${{ secrets.ODDS_API_KEY != '' }}
 
 jobs:
   scrape-and-update:
@@ -49,7 +50,7 @@ jobs:
       - name: Rescrape gamelogs
         id: gamelogs
         timeout-minutes: 30
-        if: ${{ github.event.inputs.skip_scrape != 'true' }}
+        if: inputs.skip_scrape != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.gamelogs
         env:
@@ -78,7 +79,7 @@ jobs:
       - name: Fetch prop lines from SportsGameOdds API
         id: props-fetch
         timeout-minutes: 10
-        if: ${{ secrets.ODDS_API_KEY != '' && github.event.inputs.skip_props != 'true' }}
+        if: env.HAS_ODDS_KEY == 'true' && inputs.skip_props != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --upcoming --max-objects 100 --min-remaining 200
         env:
@@ -88,7 +89,7 @@ jobs:
       - name: Check props API budget
         id: budget
         timeout-minutes: 1
-        if: ${{ secrets.ODDS_API_KEY != '' && github.event.inputs.skip_props != 'true' }}
+        if: env.HAS_ODDS_KEY == 'true' && inputs.skip_props != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --usage 2>&1 | tee /tmp/usage.txt
           remaining=$(grep -oP 'Objects remaining:\s*\K\d+' /tmp/usage.txt || echo "unknown")
@@ -103,7 +104,7 @@ jobs:
       - name: Update games table from API events (upcoming games)
         id: games-api
         timeout-minutes: 5
-        if: ${{ secrets.ODDS_API_KEY != '' && github.event.inputs.skip_props != 'true' }}
+        if: env.HAS_ODDS_KEY == 'true' && inputs.skip_props != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games_from_api
         env:
@@ -113,7 +114,7 @@ jobs:
       - name: Insert player props into DB
         id: props-insert
         timeout-minutes: 5
-        if: ${{ secrets.ODDS_API_KEY != '' && github.event.inputs.skip_props != 'true' }}
+        if: env.HAS_ODDS_KEY == 'true' && inputs.skip_props != true
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_props --json-dir=data/raw_json/2025-26
         env:
@@ -187,18 +188,18 @@ jobs:
             const failedNames = failed.map(([k]) => k).join(', ');
             const stepList = Object.entries(steps)
               .map(([k, v]) => {
-                const icon = v === 'success' ? '✅' : v === 'failure' ? '❌' : v === 'skipped' ? '⏭️' : '⚠️';
+                const icon = v === 'success' ? '\u2705' : v === 'failure' ? '\u274C' : v === 'skipped' ? '\u23ED\uFE0F' : '\u26A0\uFE0F';
                 return `- ${icon} ${k}: \`${v}\``;
               })
               .join('\n');
             const budget = '${{ steps.budget.outputs.remaining || "n/a" }}';
             const budgetNote = budget !== 'n/a' && parseInt(budget) < 500
-              ? `\n\n⚠️ **Props API budget low**: ${budget} objects remaining`
+              ? `\n\n\u26A0\uFE0F **Props API budget low**: ${budget} objects remaining`
               : '';
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Pipeline alert: ${failed.length} step(s) failed — ${new Date().toISOString().split('T')[0]}`,
+              title: `Pipeline alert: ${failed.length} step(s) failed \u2014 ${new Date().toISOString().split('T')[0]}`,
               body: [
                 `The daily pipeline completed with **${failed.length} failed step(s)**: ${failedNames}.`,
                 '',
