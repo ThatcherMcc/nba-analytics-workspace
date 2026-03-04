@@ -171,14 +171,14 @@ jobs:
         with:
           script: |
             const steps = {
-              'Rescrape gamelogs': '${{ steps.gamelogs.outcome || "skipped" }}',
-              'Update games': '${{ steps.games.outcome }}',
-              'Update player_game_stats': '${{ steps.stats.outcome }}',
-              'Fetch props': '${{ steps.props-fetch.outcome || "skipped" }}',
-              'Update games from API': '${{ steps.games-api.outcome || "skipped" }}',
-              'Insert player props': '${{ steps.props-insert.outcome || "skipped" }}',
-              'Revalidate cache': '${{ steps.revalidate.outcome }}',
-              'Health check': '${{ steps.health.outcome }}',
+              'Rescrape gamelogs': '${{ steps.gamelogs.outcome }}' || 'skipped',
+              'Update games': '${{ steps.games.outcome }}' || 'skipped',
+              'Update player_game_stats': '${{ steps.stats.outcome }}' || 'skipped',
+              'Fetch props': '${{ steps.props-fetch.outcome }}' || 'skipped',
+              'Update games from API': '${{ steps.games-api.outcome }}' || 'skipped',
+              'Insert player props': '${{ steps.props-insert.outcome }}' || 'skipped',
+              'Revalidate cache': '${{ steps.revalidate.outcome }}' || 'skipped',
+              'Health check': '${{ steps.health.outcome }}' || 'skipped',
             };
             const failed = Object.entries(steps).filter(([, v]) => v === 'failure');
             if (failed.length === 0) {
@@ -192,7 +192,7 @@ jobs:
                 return `- ${icon} ${k}: \`${v}\``;
               })
               .join('\n');
-            const budget = '${{ steps.budget.outputs.remaining || "n/a" }}';
+            const budget = '${{ steps.budget.outputs.remaining }}' || 'n/a';
             const budgetNote = budget !== 'n/a' && parseInt(budget) < 500
               ? `\n\n\u26A0\uFE0F **Props API budget low**: ${budget} objects remaining`
               : '';
