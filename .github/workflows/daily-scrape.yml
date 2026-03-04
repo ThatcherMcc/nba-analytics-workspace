@@ -43,9 +43,8 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           uv sync --project ${{ env.BACKEND_DIR }}
-        env:
-          PATH: ${{ github.home }}/.local/bin:${{ github.home }}/.cargo/bin:$PATH
 
       # ---- Phase 1: Gamelog pipeline ----
       - name: Rescrape gamelogs
