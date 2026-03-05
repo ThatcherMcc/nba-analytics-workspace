@@ -1,22 +1,75 @@
-# Daily pipeline at 3am ET: gamelogs → games → player_game_stats → props → revalidate.
-# Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET. Optional: SCRAPE_PROXIES, ODDS_API_KEY.
+# Daily pipeline: gamelogs + props at 7:30am ET, props-only refresh at 10am ET.
+# Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET, GH_PAT.
+# Optional: SCRAPE_PROXIES, ODDS_API_KEY.
 name: Daily scrape
 
 on:
   schedule:
-    # 3am US Eastern (8am UTC). Change to "0 3 * * *" for 3am UTC.
-    - cron: "0 8 * * *"
-  workflow_dispatch: # Allow manual run from Actions tab
+    # Times are UTC. During EST (Nov–Mar) these are 7:30am/10am ET.
+    # During EDT (Mar–Nov) they shift to 8:30am/11am ET.
+    - cron: "30 12 * * *"  # 7:30am ET — full pipeline (scrape + props)
+    - cron: "0 15 * * *"   # 10am ET   — props refresh only
+  workflow_dispatch:
+    inputs:
+      skip_scrape:
+        description: "Skip gamelog scraping (use existing JSON)"
+        required: false
+        default: false
+        type: boolean
+      skip_props:
+        description: "Skip props pipeline entirely"
+        required: false
+        default: false
+        type: boolean
 
 env:
   BACKEND_DIR: nba-data-backend
+  HAS_ODDS_KEY: ${{ secrets.ODDS_API_KEY != '' }}
 
 jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - name: Checkout
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            hour=$(date -u +%H)
+            # Morning run (12:30 UTC / 7:30am ET) = full pipeline; afternoon = props only
+            if [[ "$hour" -le 13 ]]; then
+              echo "run_scrape=true" >> $GITHUB_OUTPUT
+            else
+              echo "run_scrape=false" >> $GITHUB_OUTPUT
+            fi
+            echo "run_props=true" >> $GITHUB_OUTPUT
+            echo "Run mode: schedule (hour=$hour UTC)"
+          else
+            # Manual trigger — use inputs
+            if [[ "${{ inputs.skip_scrape }}" == "true" ]]; then
+              echo "run_scrape=false" >> $GITHUB_OUTPUT
+            else
+              echo "run_scrape=true" >> $GITHUB_OUTPUT
+            fi
+            if [[ "${{ inputs.skip_props }}" == "true" ]]; then
+              echo "run_props=false" >> $GITHUB_OUTPUT
+            else
+              echo "run_props=true" >> $GITHUB_OUTPUT
+            fi
+            echo "Run mode: manual (skip_scrape=${{ inputs.skip_scrape }}, skip_props=${{ inputs.skip_props }})"
+          fi
+
+      - name: Checkout workspace
         uses: actions/checkout@v4
+
+      - name: Checkout backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: ThatcherMcc/nba-data-backend
+          path: nba-data-backend
+          token: ${{ secrets.GH_PAT }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,43 +81,69 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           uv sync --project ${{ env.BACKEND_DIR }}
-        env:
-          PATH: ${{ github.home }}/.local/bin:${{ github.home }}/.cargo/bin:$PATH
 
-      # ---- Phase 1: Gamelog pipeline ----
+      # ---- Phase 1: Gamelog pipeline (morning run only) ----
       - name: Rescrape gamelogs
+        id: gamelogs
+        timeout-minutes: 30
+        if: steps.mode.outputs.run_scrape == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.gamelogs
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
         continue-on-error: true
-        # If scrape fails (rate limit, etc.), we still try to update from existing JSON
 
       - name: Update games table
+        id: games
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
 
       - name: Update player_game_stats table
+        id: stats
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
 
-      # ---- Phase 2: Props pipeline (requires ODDS_API_KEY secret) ----
+      # ---- Phase 2: Props pipeline (every run, requires ODDS_API_KEY) ----
       - name: Fetch prop lines from SportsGameOdds API
-        if: ${{ secrets.ODDS_API_KEY != '' }}
+        id: props-fetch
+        timeout-minutes: 10
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --upcoming --max-objects 100 --min-remaining 200
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         continue-on-error: true
 
+      - name: Check props API budget
+        id: budget
+        timeout-minutes: 1
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --usage 2>&1 | tee /tmp/usage.txt
+          remaining=$(grep -oP 'Objects remaining:\s*\K\d+' /tmp/usage.txt || echo "unknown")
+          echo "remaining=${remaining}" >> $GITHUB_OUTPUT
+          if [[ "${remaining}" != "unknown" && "${remaining}" -lt 500 ]]; then
+            echo "::warning::Props API budget low: ${remaining} objects remaining"
+          fi
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        continue-on-error: true
+
       - name: Update games table from API events (upcoming games)
-        if: ${{ secrets.ODDS_API_KEY != '' }}
+        id: games-api
+        timeout-minutes: 5
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games_from_api
         env:
@@ -72,7 +151,9 @@ jobs:
         continue-on-error: true
 
       - name: Insert player props into DB
-        if: ${{ secrets.ODDS_API_KEY != '' }}
+        id: props-insert
+        timeout-minutes: 5
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_props --json-dir=data/raw_json/2025-26
         env:
@@ -83,9 +164,91 @@ jobs:
 
       # ---- Phase 3: Revalidate ----
       - name: Revalidate frontend cache
+        id: revalidate
+        timeout-minutes: 2
         run: |
           curl -sf -X POST "${{ secrets.APP_URL }}/api/revalidate" \
             -H "Authorization: Bearer ${{ secrets.REVALIDATE_SECRET }}"
-        env:
-          APP_URL: ${{ secrets.APP_URL }}
-          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
+      # ---- Phase 4: Health check ----
+      - name: Health check
+        id: health
+        if: always()
+        timeout-minutes: 1
+        run: |
+          response=$(curl -sf "${{ secrets.APP_URL }}/api/health" || echo "FAILED")
+          echo "Health check response: $response"
+          if echo "$response" | grep -q '"status":"ok"'; then
+            echo "Frontend is healthy"
+          else
+            echo "::warning::Frontend health check failed"
+          fi
+        continue-on-error: true
+
+      # ---- Phase 5: Reporting ----
+      - name: Pipeline summary
+        if: always()
+        run: |
+          mode="props-only"
+          if [[ "${{ steps.mode.outputs.run_scrape }}" == "true" ]]; then mode="full"; fi
+          echo "## Pipeline Summary — $(date -u '+%Y-%m-%d %H:%M UTC') (${mode})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rescrape gamelogs | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update games | ${{ steps.games.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update player_game_stats | ${{ steps.stats.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fetch props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Props API budget | ${{ steps.budget.outputs.remaining || 'n/a' }} remaining |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update games from API | ${{ steps.games-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Insert player props | ${{ steps.props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revalidate cache | ${{ steps.revalidate.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Health check | ${{ steps.health.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Alert on step failures
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const steps = {
+              'Rescrape gamelogs': '${{ steps.gamelogs.outcome }}' || 'skipped',
+              'Update games': '${{ steps.games.outcome }}' || 'skipped',
+              'Update player_game_stats': '${{ steps.stats.outcome }}' || 'skipped',
+              'Fetch props': '${{ steps.props-fetch.outcome }}' || 'skipped',
+              'Update games from API': '${{ steps.games-api.outcome }}' || 'skipped',
+              'Insert player props': '${{ steps.props-insert.outcome }}' || 'skipped',
+              'Revalidate cache': '${{ steps.revalidate.outcome }}' || 'skipped',
+              'Health check': '${{ steps.health.outcome }}' || 'skipped',
+            };
+            const failed = Object.entries(steps).filter(([, v]) => v === 'failure');
+            if (failed.length === 0) {
+              console.log('All steps passed or were skipped. No alert needed.');
+              return;
+            }
+            const failedNames = failed.map(([k]) => k).join(', ');
+            const stepList = Object.entries(steps)
+              .map(([k, v]) => {
+                const icon = v === 'success' ? '\u2705' : v === 'failure' ? '\u274C' : v === 'skipped' ? '\u23ED\uFE0F' : '\u26A0\uFE0F';
+                return `- ${icon} ${k}: \`${v}\``;
+              })
+              .join('\n');
+            const budget = '${{ steps.budget.outputs.remaining }}' || 'n/a';
+            const budgetNote = budget !== 'n/a' && parseInt(budget) < 500
+              ? `\n\n\u26A0\uFE0F **Props API budget low**: ${budget} objects remaining`
+              : '';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Pipeline alert: ${failed.length} step(s) failed \u2014 ${new Date().toISOString().split('T')[0]}`,
+              body: [
+                `The daily pipeline completed with **${failed.length} failed step(s)**: ${failedNames}.`,
+                '',
+                `[View run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+                '',
+                '### Step Results',
+                stepList,
+                budgetNote,
+              ].join('\n'),
+              labels: ['pipeline-failure'],
+            });
