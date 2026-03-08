@@ -139,7 +139,7 @@ All in `nba-data-backend/data/`:
 
 Key tables: **players**, **games**, **teams**, **player_game_stats**, **prop_markets**, **player_props**
 
-**DNP handling**: `player_game_stats.minutes_played` stores raw strings. DNP values: `''`, `'Inactive'`, `'Inact'`, `'Did N'`, `'0'`, `'0:00'`. Frontend filters these out of averages.
+**DNP handling**: `player_game_stats.minutes_played` stores raw strings. DNP values: `''`, `'Inactive'`, `'Inact'`, `'Did N'`, `'0'`, `'0:00'`, `'Not W'` (Not With Team), `'Suspe'` (Suspended). Frontend filters these out of averages.
 
 ---
 
