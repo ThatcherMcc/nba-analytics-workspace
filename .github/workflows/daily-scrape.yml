@@ -114,6 +114,27 @@ jobs:
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
 
+      # ---- Phase 1b: Team defensive ratings (morning run only) ----
+      - name: Scrape team defensive ratings
+        id: def-scrape
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.team_defensive_ratings
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
+      - name: Update team_defensive_ratings table
+        id: def-update
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_team_defensive_ratings
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
       # ---- Phase 2: Props pipeline (every run, requires ODDS_API_KEY) ----
       - name: Fetch prop lines from SportsGameOdds API
         id: props-fetch
@@ -162,6 +183,16 @@ jobs:
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
         continue-on-error: true
 
+      # ---- Phase 2b: ML predictions (every run) ----
+      - name: Generate ML predictions
+        id: ml-predict
+        timeout-minutes: 5
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_ml_predictions
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
       # ---- Phase 3: Revalidate ----
       - name: Revalidate frontend cache
         id: revalidate
@@ -199,10 +230,13 @@ jobs:
           echo "| Rescrape gamelogs | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Update games | ${{ steps.games.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Update player_game_stats | ${{ steps.stats.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scrape defensive ratings | ${{ steps.def-scrape.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update defensive ratings | ${{ steps.def-update.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Fetch props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Props API budget | ${{ steps.budget.outputs.remaining || 'n/a' }} remaining |" >> $GITHUB_STEP_SUMMARY
           echo "| Update games from API | ${{ steps.games-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Insert player props | ${{ steps.props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ML predictions | ${{ steps.ml-predict.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Revalidate cache | ${{ steps.revalidate.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Health check | ${{ steps.health.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
 
@@ -215,9 +249,12 @@ jobs:
               'Rescrape gamelogs': '${{ steps.gamelogs.outcome }}' || 'skipped',
               'Update games': '${{ steps.games.outcome }}' || 'skipped',
               'Update player_game_stats': '${{ steps.stats.outcome }}' || 'skipped',
+              'Scrape defensive ratings': '${{ steps.def-scrape.outcome }}' || 'skipped',
+              'Update defensive ratings': '${{ steps.def-update.outcome }}' || 'skipped',
               'Fetch props': '${{ steps.props-fetch.outcome }}' || 'skipped',
               'Update games from API': '${{ steps.games-api.outcome }}' || 'skipped',
               'Insert player props': '${{ steps.props-insert.outcome }}' || 'skipped',
+              'ML predictions': '${{ steps.ml-predict.outcome }}' || 'skipped',
               'Revalidate cache': '${{ steps.revalidate.outcome }}' || 'skipped',
               'Health check': '${{ steps.health.outcome }}' || 'skipped',
             };
