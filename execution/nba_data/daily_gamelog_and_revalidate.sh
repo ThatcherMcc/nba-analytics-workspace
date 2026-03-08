@@ -48,6 +48,13 @@ echo "  Updating games table..."
 echo "  Updating player_game_stats table..."
 (cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_player_game_stats)
 
+# ---- Phase 1b: Team defensive ratings ----
+echo "  Scraping team defensive ratings..."
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.data_collection.scrapers.team_defensive_ratings) || true
+
+echo "  Updating team_defensive_ratings table..."
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_team_defensive_ratings) || true
+
 # ---- Phase 2: Props pipeline (optional: requires ODDS_API_KEY) ----
 if [[ -n "${ODDS_API_KEY:-}" ]]; then
   echo "  Fetching prop lines from SportsGameOdds API..."
@@ -68,6 +75,10 @@ if [[ -n "${ODDS_API_KEY:-}" ]]; then
 else
   echo "  Skipping props fetch (ODDS_API_KEY not set)."
 fi
+
+# ---- Phase 2b: ML predictions ----
+echo "  Generating ML predictions..."
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_ml_predictions) || true
 
 # ---- Phase 3: Revalidate frontend ----
 echo "  Revalidating frontend cache..."
