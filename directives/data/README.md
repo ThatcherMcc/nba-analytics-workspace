@@ -14,6 +14,7 @@ Procedures for scraping, processing, and loading NBA data. All paths and scripts
 - **update_props_to_db.md** – Load prop lines (CSV) into Postgres (currently via Next.js API; player_props in Neon is for ML later).
 - **fetch_player_props.md** – Get prop odds (Odds API) and optional parsing.
 - **populate_relational_schema.md** – Order and plan for filling all Neon tables (teams, players, games, player_game_stats, prop_markets, player_props); read before adding update_db scripts.
+- **mlb_pipeline.md** – Full MLB prop betting pipeline SOP: DB tables, data sources, build phases (Foundation → CI/CD), bettable markets, MLB-specific modeling notes (platoon splits, park factors, pitcher rest).
 
 Read the directive for your task, then use the listed MCP tools or execution scripts.
 
