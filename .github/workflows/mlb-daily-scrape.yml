@@ -1,0 +1,193 @@
+# MLB Daily pipeline: gamelogs at 11am ET, predictions refresh at 4pm ET.
+# NOTE: MLB season runs April–October. Disable this workflow Nov–March to avoid wasted runs.
+# Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET, GH_PAT.
+# Optional: SCRAPE_PROXIES, ODDS_API_KEY, DISCORD_WEBHOOK_URL, UPDATE_API_KEY.
+name: MLB Daily scrape
+
+on:
+  schedule:
+    # Times are UTC. ET offsets: EST (Nov–Mar) = UTC-5, EDT (Mar–Nov) = UTC-4.
+    - cron: "0 15 * * *"   # 11am ET — full pipeline (scrape + predictions)
+    - cron: "0 20 * * *"   # 4pm ET  — predictions refresh only (lineups confirmed, pre-first-pitch)
+  workflow_dispatch:
+    inputs:
+      skip_scrape:
+        description: "Skip gamelog scraping (use existing JSON)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  BACKEND_DIR: nba-data-backend
+  HAS_ODDS_KEY: ${{ secrets.ODDS_API_KEY != '' }}
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            hour=$(date -u +%H)
+            # Morning run (15 UTC / 11am ET) = full pipeline; afternoon (20 UTC / 4pm ET) = predictions only
+            if [[ "$hour" -le 16 ]]; then
+              echo "run_scrape=true" >> $GITHUB_OUTPUT
+            else
+              echo "run_scrape=false" >> $GITHUB_OUTPUT
+            fi
+            echo "Run mode: schedule (hour=$hour UTC)"
+          else
+            # Manual trigger — use inputs
+            if [[ "${{ inputs.skip_scrape }}" == "true" ]]; then
+              echo "run_scrape=false" >> $GITHUB_OUTPUT
+            else
+              echo "run_scrape=true" >> $GITHUB_OUTPUT
+            fi
+            echo "Run mode: manual (skip_scrape=${{ inputs.skip_scrape }})"
+          fi
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+
+      - name: Checkout backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: ThatcherMcc/nba-data-backend
+          path: nba-data-backend
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend deps (uv)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv sync --project ${{ env.BACKEND_DIR }}
+
+      # ---- Phase 1: Gamelog pipeline (morning run only) ----
+      - name: Scrape MLB confirmed starters
+        id: starters
+        timeout-minutes: 10
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.mlb_starters
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
+        continue-on-error: true
+
+      - name: Rescrape MLB gamelogs
+        id: gamelogs
+        timeout-minutes: 30
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.mlb_gamelogs
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
+        continue-on-error: true
+
+      - name: Update MLB games table
+        id: games
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_games
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
+      - name: Update MLB gamelogs table
+        id: stats
+        timeout-minutes: 5
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_gamelogs
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
+      # ---- Phase 2: Predictions (every run) ----
+      - name: Generate MLB predictions
+        id: ml-predict
+        timeout-minutes: 10
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_predictions
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
+
+      # ---- Phase 3: Revalidate ----
+      - name: Revalidate frontend cache
+        id: revalidate
+        timeout-minutes: 2
+        run: |
+          curl -sf -X POST "${{ secrets.APP_URL }}/api/revalidate" \
+            -H "Authorization: Bearer ${{ secrets.REVALIDATE_SECRET }}"
+        continue-on-error: true
+
+      # ---- Phase 4: Summary ----
+      - name: Pipeline summary
+        if: always()
+        run: |
+          mode="predictions-only"
+          if [[ "${{ steps.mode.outputs.run_scrape }}" == "true" ]]; then mode="full"; fi
+          echo "## MLB Pipeline Summary — $(date -u '+%Y-%m-%d %H:%M UTC') (${mode})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Scrape confirmed starters | ${{ steps.starters.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rescrape MLB gamelogs | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update MLB games | ${{ steps.games.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update MLB gamelogs | ${{ steps.stats.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generate MLB predictions | ${{ steps.ml-predict.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revalidate cache | ${{ steps.revalidate.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Alert on step failures
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const steps = {
+              'Scrape confirmed starters': '${{ steps.starters.outcome }}' || 'skipped',
+              'Rescrape MLB gamelogs':     '${{ steps.gamelogs.outcome }}' || 'skipped',
+              'Update MLB games':          '${{ steps.games.outcome }}' || 'skipped',
+              'Update MLB gamelogs':       '${{ steps.stats.outcome }}' || 'skipped',
+              'Generate MLB predictions':  '${{ steps.ml-predict.outcome }}' || 'skipped',
+              'Revalidate cache':          '${{ steps.revalidate.outcome }}' || 'skipped',
+            };
+            const failed = Object.entries(steps).filter(([, v]) => v === 'failure');
+            if (failed.length === 0) {
+              console.log('All steps passed or were skipped. No alert needed.');
+              return;
+            }
+            const failedNames = failed.map(([k]) => k).join(', ');
+            const stepList = Object.entries(steps)
+              .map(([k, v]) => {
+                const icon = v === 'success' ? '\u2705' : v === 'failure' ? '\u274C' : v === 'skipped' ? '\u23ED\uFE0F' : '\u26A0\uFE0F';
+                return `- ${icon} ${k}: \`${v}\``;
+              })
+              .join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `MLB pipeline alert: ${failed.length} step(s) failed \u2014 ${new Date().toISOString().split('T')[0]}`,
+              body: [
+                `The MLB daily pipeline completed with **${failed.length} failed step(s)**: ${failedNames}.`,
+                '',
+                `[View run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+                '',
+                '### Step Results',
+                stepList,
+              ].join('\n'),
+              labels: ['pipeline-failure'],
+            });
