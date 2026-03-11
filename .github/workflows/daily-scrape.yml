@@ -5,10 +5,11 @@ name: Daily scrape
 
 on:
   schedule:
-    # Times are UTC. During EST (Nov–Mar) these are 7:30am/10am ET.
-    # During EDT (Mar–Nov) they shift to 8:30am/11am ET.
+    # Times are UTC. During EST (Nov–Mar) these are 7:30am/10am/2pm ET.
+    # During EDT (Mar–Nov) they shift to 8:30am/11am/3pm ET.
     - cron: "30 12 * * *"  # 7:30am ET — full pipeline (scrape + props)
     - cron: "0 15 * * *"   # 10am ET   — props refresh only
+    - cron: "0 19 * * *"   # 2pm ET    — ML predictions safety net
   workflow_dispatch:
     inputs:
       skip_scrape:
@@ -104,6 +105,7 @@ jobs:
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
 
       - name: Update player_game_stats table
         id: stats
@@ -113,6 +115,7 @@ jobs:
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+        continue-on-error: true
 
       # ---- Phase 2: Props pipeline (every run, requires ODDS_API_KEY) ----
       - name: Fetch prop lines from SportsGameOdds API
@@ -160,6 +163,29 @@ jobs:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           APP_URL: ${{ secrets.APP_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
+      # ---- Phase 2b: ML predictions (every run) ----
+      - name: Generate ML predictions
+        id: ml-predict
+        timeout-minutes: 10
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_ml_predictions
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+
+      # ---- Phase 2c: Discord picks post ----
+      - name: Post daily picks to Discord
+        id: discord
+        timeout-minutes: 2
+        if: env.DISCORD_WEBHOOK_URL != ''
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python3 scripts/post_discord_picks.py || echo "Discord post failed (non-blocking)"
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         continue-on-error: true
 
       # ---- Phase 3: Revalidate ----
