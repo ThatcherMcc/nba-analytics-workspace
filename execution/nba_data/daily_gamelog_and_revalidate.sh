@@ -43,10 +43,10 @@ echo "  Rescraping gamelogs..."
 (cd "${BACKEND}" && . "${VENV}" && python3 -m src.data_collection.scrapers.gamelogs) || true
 
 echo "  Updating games table..."
-(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_games)
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_games) || echo "  WARNING: games update failed (non-blocking)"
 
 echo "  Updating player_game_stats table..."
-(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_player_game_stats)
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_player_game_stats) || echo "  WARNING: player_game_stats update failed (non-blocking)"
 
 # ---- Phase 1b: Team defensive ratings ----
 echo "  Scraping team defensive ratings..."
