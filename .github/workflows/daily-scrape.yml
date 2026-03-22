@@ -95,7 +95,6 @@ jobs:
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
-        continue-on-error: true
 
       - name: Update games table
         id: games
