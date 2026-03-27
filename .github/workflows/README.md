@@ -1,13 +1,19 @@
-# Daily scrape (3am)
+# Daily scrape
 
 **Prefer local?** To avoid GitHub Actions cost and run the same pipeline on your machine or a small server, see **`directives/infrastructure/daily_gamelog_schedule.md`** (local cron + one-shot script).
 
-The **daily-scrape** workflow runs at **3am US Eastern** (8am UTC) and:
+The **daily-scrape** workflow runs:
+
+1. Early-morning scheduled run: full NBA scrape/update through the strict wrapper, then props
+2. Later scheduled runs: props/ML refreshes without the full gamelog rescrape
+
+The full NBA run:
 
 1. Rescrapes player gamelogs → writes `nba-data-backend/data/player_gamelog_2026.json`
-2. Updates the **games** table from that JSON
-3. Updates the **player_game_stats** table
-4. Calls **POST /api/revalidate** on the frontend so cached homepage and player pages refresh
+2. Validates the scrape output is fresh and non-empty
+3. Updates the **games** table from that JSON
+4. Updates the **player_game_stats** table
+5. Calls **POST /api/revalidate** on the frontend so cached homepage and player pages refresh
 
 ## Setup
 
@@ -37,7 +43,7 @@ On the host where the frontend runs (e.g. Vercel), set:
 
 Edit **`.github/workflows/daily-scrape.yml`**:
 
-- **3am US Eastern** (current): `cron: "0 8 * * *"` (8am UTC).
+- **Current schedule**: `30 12 * * *` full scrape, `0 15 * * *` props refresh, `0 19 * * *` afternoon safety net (UTC).
 - **3am UTC**: `cron: "0 3 * * *"`.
 - **3am Pacific**: `cron: "0 15 * * *"` (3am PT = 11am UTC next day; or `0 15 * * *` is 3am PT in winter).
 
@@ -49,4 +55,4 @@ From the repo: **Actions → Daily scrape → Run workflow**.
 
 ## If the scrape step fails
 
-The workflow uses `continue-on-error: true` for the gamelog scrape. If the scrape fails (e.g. rate limits), the run still executes **Update games** and **Update player_game_stats** using the existing `player_gamelog_2026.json`, then revalidates. Fix the scraper or add proxies and re-run.
+The workflow now uses the strict runner at `execution/nba_data/full_rescrape_and_update.sh` for scheduled NBA runs. If the scrape fails, if no proxies pass preflight, or if the resulting JSON is stale, the NBA stage fails instead of silently updating the DB from stale gamelog JSON.

@@ -1,4 +1,4 @@
-# Daily pipeline: gamelogs + props at 7:30am ET, props-only refresh at 10am ET.
+# Daily pipeline: early-morning full NBA scrape/update, later props/ML refreshes.
 # Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET, GH_PAT.
 # Optional: SCRAPE_PROXIES, ODDS_API_KEY.
 name: Daily scrape
@@ -7,9 +7,9 @@ on:
   schedule:
     # Times are UTC. During EST (Nov–Mar) these are 7:30am/10am/2pm ET.
     # During EDT (Mar–Nov) they shift to 8:30am/11am/3pm ET.
-    - cron: "30 12 * * *"  # 7:30am ET — full pipeline (scrape + props)
-    - cron: "0 15 * * *"   # 10am ET   — props refresh only
-    - cron: "0 19 * * *"   # 2pm ET    — ML predictions safety net
+    - cron: "30 12 * * *"  # Morning run: full scrape + props
+    - cron: "0 15 * * *"   # Midday refresh: props only
+    - cron: "0 19 * * *"   # Afternoon safety net: props/ML only
   workflow_dispatch:
     inputs:
       skip_scrape:
@@ -38,15 +38,14 @@ jobs:
         id: mode
         run: |
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            hour=$(date -u +%H)
-            # Morning run (12:30 UTC / 7:30am ET) = full pipeline; afternoon = props only
-            if [[ "$hour" -le 13 ]]; then
+            schedule="${{ github.event.schedule }}"
+            if [[ "$schedule" == "30 12 * * *" ]]; then
               echo "run_scrape=true" >> $GITHUB_OUTPUT
             else
               echo "run_scrape=false" >> $GITHUB_OUTPUT
             fi
             echo "run_props=true" >> $GITHUB_OUTPUT
-            echo "Run mode: schedule (hour=$hour UTC)"
+            echo "Run mode: schedule (cron=${schedule})"
           else
             # Manual trigger — use inputs
             if [[ "${{ inputs.skip_scrape }}" == "true" ]]; then
@@ -68,7 +67,7 @@ jobs:
       - name: Checkout backend repo
         uses: actions/checkout@v4
         with:
-          repository: ThatcherMcc/nba-data-backend
+          repository: ThatcherMcc/nba-data-scraper
           path: nba-data-backend
           token: ${{ secrets.GH_PAT }}
 
@@ -85,36 +84,19 @@ jobs:
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           uv sync --project ${{ env.BACKEND_DIR }}
 
-      # ---- Phase 1: Gamelog pipeline (morning run only) ----
-      - name: Rescrape gamelogs
+      # ---- Phase 1: Gamelog pipeline ----
+      - name: Strict NBA scrape and DB update
         id: gamelogs
-        timeout-minutes: 30
+        timeout-minutes: 120
         if: steps.mode.outputs.run_scrape == 'true'
         run: |
-          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.gamelogs
+          chmod +x execution/nba_data/full_rescrape_and_update.sh
+          ./execution/nba_data/full_rescrape_and_update.sh
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
           SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
-
-      - name: Update games table
-        id: games
-        timeout-minutes: 5
-        if: steps.mode.outputs.run_scrape == 'true'
-        run: |
-          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_games
-        env:
-          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
-        continue-on-error: true
-
-      - name: Update player_game_stats table
-        id: stats
-        timeout-minutes: 5
-        if: steps.mode.outputs.run_scrape == 'true'
-        run: |
-          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_player_game_stats
-        env:
-          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
-        continue-on-error: true
 
       # ---- Phase 2: Props pipeline (every run, requires ODDS_API_KEY) ----
       - name: Fetch prop lines from SportsGameOdds API
@@ -215,15 +197,13 @@ jobs:
       - name: Pipeline summary
         if: always()
         run: |
-          mode="props-only"
-          if [[ "${{ steps.mode.outputs.run_scrape }}" == "true" ]]; then mode="full"; fi
+          mode="full"
+          if [[ "${{ steps.mode.outputs.run_scrape }}" != "true" ]]; then mode="props-only"; fi
           echo "## Pipeline Summary — $(date -u '+%Y-%m-%d %H:%M UTC') (${mode})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Rescrape gamelogs | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Update games | ${{ steps.games.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Update player_game_stats | ${{ steps.stats.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Strict NBA scrape + DB update | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Fetch props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Props API budget | ${{ steps.budget.outputs.remaining || 'n/a' }} remaining |" >> $GITHUB_STEP_SUMMARY
           echo "| Update games from API | ${{ steps.games-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
@@ -237,9 +217,7 @@ jobs:
         with:
           script: |
             const steps = {
-              'Rescrape gamelogs': '${{ steps.gamelogs.outcome }}' || 'skipped',
-              'Update games': '${{ steps.games.outcome }}' || 'skipped',
-              'Update player_game_stats': '${{ steps.stats.outcome }}' || 'skipped',
+              'Strict NBA scrape + DB update': '${{ steps.gamelogs.outcome }}' || 'skipped',
               'Fetch props': '${{ steps.props-fetch.outcome }}' || 'skipped',
               'Update games from API': '${{ steps.games-api.outcome }}' || 'skipped',
               'Insert player props': '${{ steps.props-insert.outcome }}' || 'skipped',

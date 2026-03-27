@@ -40,13 +40,13 @@ echo "$(date '+%Y-%m-%dT%H:%M:%S') Starting daily pipeline"
 
 # ---- Phase 1: Gamelog pipeline ----
 echo "  Rescraping gamelogs..."
-(cd "${BACKEND}" && . "${VENV}" && python3 -m src.data_collection.scrapers.gamelogs) || true
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.data_collection.scrapers.gamelogs)
 
 echo "  Updating games table..."
-(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_games) || echo "  WARNING: games update failed (non-blocking)"
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_games)
 
 echo "  Updating player_game_stats table..."
-(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_player_game_stats) || echo "  WARNING: player_game_stats update failed (non-blocking)"
+(cd "${BACKEND}" && . "${VENV}" && python3 -m src.api.update_db.update_db_player_game_stats)
 
 # ---- Phase 2: Props pipeline (optional: requires ODDS_API_KEY) ----
 if [[ -n "${ODDS_API_KEY:-}" ]]; then
