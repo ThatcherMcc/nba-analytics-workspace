@@ -104,50 +104,67 @@ if bad:
 PY
 
 RAW_PROXIES="${SCRAPE_PROXIES:-${PROXY_URLS:-}}"
+MIN_WORKING_PROXIES="${MIN_WORKING_SCRAPE_PROXIES:-10}"
 if [[ -n "${RAW_PROXIES}" ]]; then
   echo "Validating configured proxies before scrape"
   WORKING_PROXIES="$(
   run_backend_python - <<'PY'
 import os
 import sys
-import requests
+import cloudscraper
 
 raw = os.getenv("SCRAPE_PROXIES") or os.getenv("PROXY_URLS") or ""
 proxies = [p.strip() for p in raw.split(",") if p.strip()]
 test_url = "https://www.basketball-reference.com/players/c/curryst01/gamelog/2026"
 working = []
+status_counts = {}
+scraper = cloudscraper.create_scraper(
+    browser={
+        "browser": "chrome",
+        "platform": "windows",
+        "mobile": False,
+    }
+)
 
 for idx, proxy in enumerate(proxies, start=1):
     proxy_dict = {"http": proxy, "https": proxy}
     try:
-        resp = requests.get(test_url, proxies=proxy_dict, timeout=12)
+        resp = scraper.get(test_url, proxies=proxy_dict, timeout=12)
+        status_counts[resp.status_code] = status_counts.get(resp.status_code, 0) + 1
         if resp.status_code == 200 and "player_game_log_reg" in resp.text:
             print(f"proxy {idx}: ok")
             working.append(proxy)
         else:
             print(f"proxy {idx}: rejected status={resp.status_code}", file=sys.stderr)
-    except requests.RequestException as exc:
+    except Exception as exc:
+        key = type(exc).__name__
+        status_counts[key] = status_counts.get(key, 0) + 1
         print(f"proxy {idx}: failed {exc}", file=sys.stderr)
 
+summary = ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items(), key=lambda kv: str(kv[0])))
+if summary:
+    print(f"proxy preflight summary: {summary}", file=sys.stderr)
 print(",".join(working))
 PY
   )"
   WORKING_PROXIES="$(printf '%s\n' "${WORKING_PROXIES}" | tail -n 1)"
+  WORKING_PROXY_COUNT="$(printf '%s' "${WORKING_PROXIES}" | awk -F',' '{print NF}')"
 
   if [[ -n "${WORKING_PROXIES}" ]]; then
     export SCRAPE_PROXIES="${WORKING_PROXIES}"
-    echo "Using $(run_backend_python - <<'PY'
-import os
-print(len([p for p in (os.getenv('SCRAPE_PROXIES') or '').split(',') if p.strip()]))
-PY
-    ) working proxies for scrape"
+    echo "Working proxies passed preflight: ${WORKING_PROXY_COUNT}"
+    if [[ "${WORKING_PROXY_COUNT}" -lt "${MIN_WORKING_PROXIES}" ]]; then
+      echo "Error: only ${WORKING_PROXY_COUNT} proxies passed preflight; require at least ${MIN_WORKING_PROXIES}."
+      exit 1
+    fi
+    echo "Using ${WORKING_PROXY_COUNT} working proxies for scrape"
   else
-    echo "No working proxies passed preflight. Falling back to direct no-proxy scrape."
-    unset SCRAPE_PROXIES
-    unset PROXY_URLS
+    echo "Error: no working proxies passed preflight; require at least ${MIN_WORKING_PROXIES}."
+    exit 1
   fi
 else
-  echo "SCRAPE_PROXIES not set. Running direct no-proxy scrape."
+  echo "Error: SCRAPE_PROXIES not set. This strict run requires at least ${MIN_WORKING_PROXIES} working proxies."
+  exit 1
 fi
 
 echo "Rescraping full NBA gamelog set"
