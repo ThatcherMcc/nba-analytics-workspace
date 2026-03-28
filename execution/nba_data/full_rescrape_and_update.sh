@@ -177,8 +177,8 @@ from datetime import date, timedelta
 from pathlib import Path
 import sys
 
-path = Path("nba-data-backend/data/player_gamelog_2026.json")
-retry_path = Path("nba-data-backend/data/gamelog_retry_names.txt")
+path = Path("data/player_gamelog_2026.json")
+retry_path = Path("data/gamelog_retry_names.txt")
 
 if not path.exists():
     print(f"Error: missing {path}", file=sys.stderr)
