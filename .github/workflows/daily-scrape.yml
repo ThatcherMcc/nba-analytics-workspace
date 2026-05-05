@@ -68,7 +68,7 @@ jobs:
       - name: Checkout backend repo
         uses: actions/checkout@v4
         with:
-          repository: ThatcherMcc/nba-data-scraper
+          repository: ThatcherMcc/nba-data-backend
           path: nba-data-backend
           token: ${{ secrets.GH_PAT }}
 
