@@ -1,6 +1,7 @@
-# Daily pipeline: early-morning full NBA scrape/update, later props/ML refreshes.
+# Daily pipeline: early-morning full NBA scrape/update, later NBA/MLB props and ML refreshes.
 # Required secrets: POSTGRES_URL, APP_URL, REVALIDATE_SECRET, GH_PAT.
-# Optional: SCRAPE_PROXIES, ODDS_API_KEY.
+# Optional secrets: WEBSHARE_API_KEY, SCRAPE_PROXIES, ODDS_API_KEY.
+# Optional vars: WEBSHARE_PROXY_MODE, WEBSHARE_PLAN_ID.
 name: Daily scrape
 
 on:
@@ -91,20 +92,59 @@ jobs:
         if: steps.mode.outputs.run_scrape == 'true'
         run: |
           chmod +x execution/nba_data/full_rescrape_and_update.sh
-          ./execution/nba_data/full_rescrape_and_update.sh
+          chmod +x execution/nba_data/run_nba_refresh_with_fallback.sh
+          ./execution/nba_data/run_nba_refresh_with_fallback.sh
         env:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           APP_URL: ${{ secrets.APP_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          WEBSHARE_API_KEY: ${{ secrets.WEBSHARE_API_KEY }}
+          WEBSHARE_PROXY_MODE: ${{ vars.WEBSHARE_PROXY_MODE }}
+          WEBSHARE_PLAN_ID: ${{ vars.WEBSHARE_PLAN_ID }}
           SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
 
+      - name: Refresh MLB player URLs
+        id: mlb-player-urls
+        timeout-minutes: 45
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.mlb_player_urls
+        env:
+          WEBSHARE_API_KEY: ${{ secrets.WEBSHARE_API_KEY }}
+          WEBSHARE_PROXY_MODE: ${{ vars.WEBSHARE_PROXY_MODE }}
+          WEBSHARE_PLAN_ID: ${{ vars.WEBSHARE_PLAN_ID }}
+          SCRAPE_PROXIES: ${{ secrets.SCRAPE_PROXIES }}
+        continue-on-error: true
+
+      - name: Update MLB players table
+        id: mlb-players
+        timeout-minutes: 10
+        if: steps.mode.outputs.run_scrape == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_players
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
       # ---- Phase 2: Props pipeline (every run, requires ODDS_API_KEY) ----
-      - name: Fetch prop lines from SportsGameOdds API
+      - name: Fetch NBA prop lines from SportsGameOdds API
         id: props-fetch
         timeout-minutes: 10
         if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
         run: |
           cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.props --upcoming --max-objects 100 --min-remaining 200
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        continue-on-error: true
+
+      - name: Fetch MLB prop lines from SportsGameOdds API
+        id: mlb-props-fetch
+        timeout-minutes: 10
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.data_collection.scrapers.mlb_props --today --max-objects 40 --min-remaining 200
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         continue-on-error: true
@@ -146,6 +186,18 @@ jobs:
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
         continue-on-error: true
 
+      - name: Insert MLB player props into DB
+        id: mlb-props-insert
+        timeout-minutes: 5
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_player_props --json-dir=data/raw_json/mlb
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
+
       # ---- Phase 2b: ML predictions (every run) ----
       - name: Generate ML predictions
         id: ml-predict
@@ -156,6 +208,18 @@ jobs:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           APP_URL: ${{ secrets.APP_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+
+      - name: Generate MLB predictions
+        id: mlb-predict
+        timeout-minutes: 10
+        if: env.HAS_ODDS_KEY == 'true' && steps.mode.outputs.run_props == 'true'
+        run: |
+          cd ${{ env.BACKEND_DIR }} && uv run python -m src.api.update_db.update_db_mlb_predictions
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          APP_URL: ${{ secrets.APP_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        continue-on-error: true
 
       # ---- Phase 2c: Discord picks post ----
       - name: Post daily picks to Discord
@@ -204,10 +268,16 @@ jobs:
           echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Strict NBA scrape + DB update | ${{ steps.gamelogs.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Fetch props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Refresh MLB player URLs | ${{ steps.mlb-player-urls.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update MLB players table | ${{ steps.mlb-players.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fetch NBA props | ${{ steps.props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fetch MLB props | ${{ steps.mlb-props-fetch.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Props API budget | ${{ steps.budget.outputs.remaining || 'n/a' }} remaining |" >> $GITHUB_STEP_SUMMARY
           echo "| Update games from API | ${{ steps.games-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Insert player props | ${{ steps.props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Insert NBA player props | ${{ steps.props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Insert MLB player props | ${{ steps.mlb-props-insert.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generate NBA predictions | ${{ steps.ml-predict.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generate MLB predictions | ${{ steps.mlb-predict.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Revalidate cache | ${{ steps.revalidate.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Health check | ${{ steps.health.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
 
@@ -218,9 +288,15 @@ jobs:
           script: |
             const steps = {
               'Strict NBA scrape + DB update': '${{ steps.gamelogs.outcome }}' || 'skipped',
-              'Fetch props': '${{ steps.props-fetch.outcome }}' || 'skipped',
+              'Refresh MLB player URLs': '${{ steps.mlb-player-urls.outcome }}' || 'skipped',
+              'Update MLB players table': '${{ steps.mlb-players.outcome }}' || 'skipped',
+              'Fetch NBA props': '${{ steps.props-fetch.outcome }}' || 'skipped',
+              'Fetch MLB props': '${{ steps.mlb-props-fetch.outcome }}' || 'skipped',
               'Update games from API': '${{ steps.games-api.outcome }}' || 'skipped',
-              'Insert player props': '${{ steps.props-insert.outcome }}' || 'skipped',
+              'Insert NBA player props': '${{ steps.props-insert.outcome }}' || 'skipped',
+              'Insert MLB player props': '${{ steps.mlb-props-insert.outcome }}' || 'skipped',
+              'Generate NBA predictions': '${{ steps.ml-predict.outcome }}' || 'skipped',
+              'Generate MLB predictions': '${{ steps.mlb-predict.outcome }}' || 'skipped',
               'Revalidate cache': '${{ steps.revalidate.outcome }}' || 'skipped',
               'Health check': '${{ steps.health.outcome }}' || 'skipped',
             };

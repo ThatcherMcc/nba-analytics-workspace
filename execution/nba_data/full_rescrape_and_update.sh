@@ -103,9 +103,17 @@ if bad:
     raise SystemExit(1)
 PY
 
-RAW_PROXIES="${SCRAPE_PROXIES:-${PROXY_URLS:-}}"
+RAW_PROXIES="$(
+run_backend_python - <<'PY'
+from src.utils.proxies import load_proxy_list
+
+print(",".join(load_proxy_list()))
+PY
+)"
+RAW_PROXIES="$(printf '%s\n' "${RAW_PROXIES}" | tail -n 1)"
 MIN_WORKING_PROXIES="${MIN_WORKING_SCRAPE_PROXIES:-10}"
 if [[ -n "${RAW_PROXIES}" ]]; then
+  export SCRAPE_PROXIES="${RAW_PROXIES}"
   echo "Validating configured proxies before scrape"
   WORKING_PROXIES="$(
   run_backend_python - <<'PY'
@@ -173,6 +181,7 @@ run_backend_module "src.data_collection.scrapers.gamelogs"
 echo "Validating rescrape output"
 run_backend_python - <<'PY'
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 import sys
@@ -188,21 +197,126 @@ data = json.loads(path.read_text())
 player_count = len(data)
 row_count = 0
 max_date = ""
+team_max_dates = {}
 for player in data:
     for row in player.get("gamelogs") or []:
         row_count += 1
         d = str(row.get("DATE") or "")
         if d > max_date:
             max_date = d
+        team_code = str(row.get("PLAYER_TEAM") or "").strip().upper()
+        if team_code and d and d > team_max_dates.get(team_code, ""):
+            team_max_dates[team_code] = d
 
 if player_count == 0 or row_count == 0 or not max_date:
     print(f"Error: invalid scrape output players={player_count} rows={row_count} max_date={max_date!r}", file=sys.stderr)
     sys.exit(1)
 
-fresh_cutoff = (date.today() - timedelta(days=3)).isoformat()
-if max_date < fresh_cutoff:
-    print(f"Error: scrape output is stale. max_date={max_date}, expected >= {fresh_cutoff}", file=sys.stderr)
-    sys.exit(1)
+today = date.today()
+
+def load_active_team_next_dates():
+    db_url = os.getenv("POSTGRES_URL")
+    if not db_url:
+        return {}, "none"
+
+    try:
+        import psycopg2
+    except ImportError:
+        return {}, "none"
+
+    upcoming_end = today + timedelta(days=3)
+    team_next_dates = {}
+
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        # Prefer games that currently have player props, since that is what the
+        # app is actually showing. Fall back to upcoming games if no props are present.
+        cur.execute(
+            """
+            SELECT DISTINCT g.game_date::text, ht.team_code, at.team_code
+            FROM player_props pp
+            JOIN games g ON g.game_id = pp.game_id
+            JOIN teams ht ON ht.team_id = g.home_team_id
+            JOIN teams at ON at.team_id = g.away_team_id
+            WHERE g.game_date BETWEEN %s AND %s
+            """,
+            (today.isoformat(), upcoming_end.isoformat()),
+        )
+        rows = cur.fetchall()
+        source = "player_props"
+
+        if not rows:
+            cur.execute(
+                """
+                SELECT DISTINCT g.game_date::text, ht.team_code, at.team_code
+                FROM games g
+                JOIN teams ht ON ht.team_id = g.home_team_id
+                JOIN teams at ON at.team_id = g.away_team_id
+                WHERE g.game_date BETWEEN %s AND %s
+                """,
+                (today.isoformat(), upcoming_end.isoformat()),
+            )
+            rows = cur.fetchall()
+            source = "games"
+
+        cur.close()
+        conn.close()
+
+        for game_date, home_code, away_code in rows:
+            for code in (home_code, away_code):
+                code = str(code or "").strip().upper()
+                if not code:
+                    continue
+                prev = team_next_dates.get(code)
+                if prev is None or game_date < prev:
+                    team_next_dates[code] = game_date
+        return team_next_dates, source
+    except Exception as exc:
+        print(f"Warning: could not load active teams from DB for freshness validation: {exc}", file=sys.stderr)
+        return {}, "none"
+
+team_next_dates, freshness_source = load_active_team_next_dates()
+if team_next_dates:
+    stale_teams = []
+    missing_teams = []
+
+    for team_code, next_game_date in sorted(team_next_dates.items()):
+        latest_team_date = team_max_dates.get(team_code)
+        if not latest_team_date:
+            missing_teams.append(team_code)
+            continue
+
+        # Around play-in / playoffs, active teams can go several days between games.
+        # Validate the scrape against the teams that currently have lined games and
+        # allow a wider gap from their next scheduled game.
+        fresh_cutoff = (date.fromisoformat(next_game_date) - timedelta(days=7)).isoformat()
+        if latest_team_date < fresh_cutoff:
+            stale_teams.append((team_code, latest_team_date, fresh_cutoff, next_game_date))
+
+    if missing_teams:
+        print(
+            f"Error: scrape output is missing gamelog data for active teams from {freshness_source}: {', '.join(missing_teams)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if stale_teams:
+        details = "; ".join(
+            f"{team}: max_date={team_date}, expected >= {cutoff} for next_game={next_game}"
+            for team, team_date, cutoff, next_game in stale_teams[:8]
+        )
+        print(
+            f"Error: scrape output is stale for active teams from {freshness_source}. {details}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+else:
+    fresh_cutoff = (today - timedelta(days=7)).isoformat()
+    if max_date < fresh_cutoff:
+        print(f"Error: scrape output is stale. max_date={max_date}, expected >= {fresh_cutoff}", file=sys.stderr)
+        sys.exit(1)
 
 failed_count = 0
 if retry_path.exists():
@@ -211,7 +325,12 @@ if retry_path.exists():
         if line.strip() and not line.lstrip().startswith("#")
     )
 
-print(f"Validated scrape output: players={player_count} rows={row_count} max_date={max_date} failed_players={failed_count}")
+active_team_count = len(team_next_dates)
+print(
+    f"Validated scrape output: players={player_count} rows={row_count} "
+    f"max_date={max_date} active_teams={active_team_count} "
+    f"freshness_source={freshness_source} failed_players={failed_count}"
+)
 PY
 
 echo "Updating games table"
